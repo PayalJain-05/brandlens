@@ -7,6 +7,14 @@ const corsHeaders = {
     "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
+const STAGES = [
+  { id: "profile_synthesis", label: "Understanding your professional identity" },
+  { id: "brand_audit", label: "Auditing your professional brand" },
+  { id: "story_mining", label: "Finding stories in your work" },
+  { id: "gap_analysis", label: "Identifying gaps and inconsistencies" },
+  { id: "action_plan", label: "Building your action plan" },
+] as const;
+
 const SYSTEM_PROMPT = `You are BrandLens, an AI professional identity and personal-brand analyst.
 
 Your job is to analyze the professional identity represented by the user's provided materials.
@@ -144,11 +152,9 @@ GUIDELINES:
 - Never invent experience, companies, achievements, qualifications, or metrics.`;
 
 function safeParseJson(text: string): unknown | null {
-  // Try direct parse first
   try {
     return JSON.parse(text);
   } catch {
-    // Try extracting JSON from markdown code fences or surrounding text
     const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (fenceMatch) {
       try {
@@ -157,7 +163,6 @@ function safeParseJson(text: string): unknown | null {
         /* continue */
       }
     }
-    // Try finding the first { and last }
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
     if (start !== -1 && end > start) {
@@ -174,15 +179,21 @@ function safeParseJson(text: string): unknown | null {
 function validateAnalysis(obj: unknown): boolean {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
   const o = obj as Record<string, unknown>;
-  // Check brandScore exists and has numeric overall
   if (!o.brandScore || typeof o.brandScore !== 'object') return false;
   const bs = o.brandScore as Record<string, unknown>;
   if (typeof bs.overall !== 'number') return false;
-  // Check arrays exist
   if (!Array.isArray(o.strengths)) return false;
   if (!Array.isArray(o.gaps)) return false;
   if (!Array.isArray(o.skills)) return false;
   return true;
+}
+
+function sseEvent(data: Record<string, unknown>): string {
+  return `data: ${JSON.stringify(data)}\n\n`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 Deno.serve(async (req: Request) => {
@@ -234,96 +245,122 @@ ${prompt}
 ==============================
 Return ONLY the JSON now.`;
 
-    const geminiResponse = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': apiKey,
-        },
-        body: JSON.stringify({
-          contents: [
+    const stream = new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder();
+
+        const send = (data: Record<string, unknown>) => {
+          controller.enqueue(encoder.encode(sseEvent(data)));
+        };
+
+        try {
+          send({ type: 'stages', stages: STAGES.map((s) => ({ id: s.id, label: s.label })) });
+
+          send({ type: 'stage_start', stageIndex: 0, stageId: STAGES[0].id, label: STAGES[0].label });
+          await sleep(300);
+          send({ type: 'stage_complete', stageIndex: 0, stageId: STAGES[0].id });
+
+          send({ type: 'stage_start', stageIndex: 1, stageId: STAGES[1].id, label: STAGES[1].label });
+
+          const geminiResponse = await fetch(
+            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
             {
-              parts: [{ text: fullPrompt }],
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': apiKey,
+              },
+              body: JSON.stringify({
+                contents: [
+                  {
+                    parts: [{ text: fullPrompt }],
+                  },
+                ],
+                generationConfig: {
+                  temperature: 0.7,
+                  maxOutputTokens: 8192,
+                  responseMimeType: 'application/json',
+                },
+              }),
             },
-          ],
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 8192,
-            responseMimeType: 'application/json',
-          },
-        }),
+          );
+
+          if (!geminiResponse.ok) {
+            const errorText = await geminiResponse.text();
+            console.error('Gemini API error:', geminiResponse.status, errorText);
+            send({
+              type: 'error',
+              error: 'GEMINI_API_ERROR',
+              message: 'Gemini API returned an error.',
+            });
+            controller.close();
+            return;
+          }
+
+          const geminiData = await geminiResponse.json();
+          const candidate = geminiData?.candidates?.[0];
+          const text = candidate?.content?.parts?.[0]?.text;
+
+          if (!text) {
+            send({
+              type: 'error',
+              error: 'INVALID_ANALYSIS_RESPONSE',
+              message: 'Gemini returned no content.',
+            });
+            controller.close();
+            return;
+          }
+
+          const parsed = safeParseJson(text);
+
+          if (!parsed || !validateAnalysis(parsed)) {
+            console.error('Failed to parse or validate Gemini response:', text.slice(0, 500));
+            send({
+              type: 'error',
+              error: 'INVALID_ANALYSIS_RESPONSE',
+              message: 'Gemini response could not be parsed as valid analysis JSON.',
+            });
+            controller.close();
+            return;
+          }
+
+          send({ type: 'stage_complete', stageIndex: 1, stageId: STAGES[1].id });
+
+          send({ type: 'stage_start', stageIndex: 2, stageId: STAGES[2].id, label: STAGES[2].label });
+          await sleep(200);
+          send({ type: 'stage_complete', stageIndex: 2, stageId: STAGES[2].id });
+
+          send({ type: 'stage_start', stageIndex: 3, stageId: STAGES[3].id, label: STAGES[3].label });
+          await sleep(200);
+          send({ type: 'stage_complete', stageIndex: 3, stageId: STAGES[3].id });
+
+          send({ type: 'stage_start', stageIndex: 4, stageId: STAGES[4].id, label: STAGES[4].label });
+          await sleep(200);
+          send({ type: 'stage_complete', stageIndex: 4, stageId: STAGES[4].id });
+
+          send({ type: 'complete', analysis: parsed });
+        } catch (error) {
+          console.error('Edge function error:', error);
+          send({
+            type: 'error',
+            error: 'INTERNAL_ERROR',
+            message: error instanceof Error ? error.message : 'Unknown error occurred.',
+          });
+        } finally {
+          controller.close();
+        }
       },
-    );
+    });
 
-    if (!geminiResponse.ok) {
-      const errorText = await geminiResponse.text();
-      console.error('Gemini API error:', geminiResponse.status, errorText);
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: 'GEMINI_API_ERROR',
-          details: {
-            message: 'Gemini API returned an error.',
-            status: geminiResponse.status,
-          },
-        }),
-        {
-          status: 502,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        },
-      );
-    }
-
-    const geminiData = await geminiResponse.json();
-
-    const candidate = geminiData?.candidates?.[0];
-    const text = candidate?.content?.parts?.[0]?.text;
-
-    if (!text) {
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: 'INVALID_ANALYSIS_RESPONSE',
-          details: { message: 'Gemini returned no content.' },
-        }),
-        {
-          status: 502,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        },
-      );
-    }
-
-    const parsed = safeParseJson(text);
-
-    if (!parsed || !validateAnalysis(parsed)) {
-      console.error('Failed to parse or validate Gemini response:', text.slice(0, 500));
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: 'INVALID_ANALYSIS_RESPONSE',
-          details: {
-            message: 'Gemini response could not be parsed as valid analysis JSON.',
-          },
-        }),
-        {
-          status: 502,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        },
-      );
-    }
-
-    return new Response(
-      JSON.stringify({
-        success: true,
-        analysis: parsed,
-      }),
-      {
-        status: 200,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
       },
-    );
+    });
   } catch (error) {
     console.error('Edge function error:', error);
     return new Response(
